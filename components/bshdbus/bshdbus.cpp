@@ -56,9 +56,6 @@ static constexpr uint16_t BSHDBUS_RX_TIMEOUT = 20;
    back-off; an identical frame within this window after such a frame is taken as the retransmission */
 static constexpr uint32_t BSHDBUS_RETRANSMIT_WINDOW = 250;
 
-/* Interval for the summary of bus errors, which are logged one by one only at VERBOSE level */
-static constexpr uint32_t BSHDBUS_STATS_INTERVAL = 60000;
-
 /* Sufficient for most cases, some larger frames may be truncated */
 static constexpr size_t BSHDBUS_MAX_LOG_BYTES = 128;
 
@@ -159,7 +156,6 @@ void BSHDBus::loop() {
                delta_rx);
       this->expect_ack_ = false;
       this->last_frame_unacked_ = true;
-      this->stats_.missed_acks++;
 #ifdef USE_BSHDBUS_SEND
       this->on_tx_ack_(false);
 #endif
@@ -177,20 +173,6 @@ void BSHDBus::loop() {
   if (this->tx_enabled_)
     this->process_tx_(now, received);
 #endif
-
-  if (now - this->stats_since_ >= BSHDBUS_STATS_INTERVAL) {
-    const BusStats &st = this->stats_;
-    if (st.missed_acks || st.busy_replies || st.crc_error_replies || st.retransmissions || st.skipped_bytes) {
-      ESP_LOGD(TAG,
-               "Bus in last %" PRIu32 " s: %" PRIu32 " frames, %" PRIu32 " retransmissions ignored, %" PRIu32
-               " missed ACKs, %" PRIu32 " busy and %" PRIu32 " CRC error replies, %" PRIu32
-               " bytes of invalid data skipped",
-               (now - this->stats_since_) / 1000, st.frames, st.retransmissions, st.missed_acks, st.busy_replies,
-               st.crc_error_replies, st.skipped_bytes);
-    }
-    this->stats_ = BusStats{};
-    this->stats_since_ = now;
-  }
 }
 
 /* Extracts all complete frames from rx_buffer_. A byte that does not start a valid frame (bad length,
@@ -219,7 +201,6 @@ void BSHDBus::parse_rx_buffer_(bool flush) {
   auto log_skipped = [&]() {
     if (skip_reason == nullptr)
       return;
-    this->stats_.skipped_bytes += pos - skip_start;
     ESP_LOGV(TAG, "Skipped %zu bytes of invalid data (%s), resynchronized: 0x%s", pos - skip_start,
              LOG_STR_ARG(skip_reason), format_hex_to(hex_buf, sizeof(hex_buf), data + skip_start, pos - skip_start));
     skip_reason = nullptr;
@@ -255,11 +236,6 @@ void BSHDBus::parse_rx_buffer_(bool flush) {
           log_skipped();
           ESP_LOGV(TAG, "Received %s reply 0x%02x for dest 0x%02x of preceding frame",
                    reply == 0x03 ? LOG_STR_LITERAL("busy") : LOG_STR_LITERAL("CRC error"), ack, this->last_dest_);
-          if (reply == 0x03) {
-            this->stats_.busy_replies++;
-          } else {
-            this->stats_.crc_error_replies++;
-          }
           this->expect_ack_ = false;
           this->last_frame_unacked_ = true;
 #ifdef USE_BSHDBUS_SEND
@@ -272,7 +248,6 @@ void BSHDBus::parse_rx_buffer_(bool flush) {
       ESP_LOGV(TAG, "Missed ACK for dest 0x%02x of preceding frame", this->last_dest_);
       this->expect_ack_ = false;
       this->last_frame_unacked_ = true;
-      this->stats_.missed_acks++;
 #ifdef USE_BSHDBUS_SEND
       this->on_tx_ack_(false);
 #endif
@@ -306,7 +281,6 @@ void BSHDBus::parse_rx_buffer_(bool flush) {
     const uint16_t command = encode_uint16(this->frame_[2], this->frame_[3]);
     /* Skip bytes for LL + DS + CCCC at beginning, CRC at end */
     this->message_.assign(this->frame_.begin() + 1 + 1 + 2, this->frame_.end() - 2);
-    this->stats_.frames++;
 
     const uint32_t now = App.get_loop_component_start_time();
     const bool retransmission = this->last_frame_unacked_ &&
@@ -322,7 +296,6 @@ void BSHDBus::parse_rx_buffer_(bool flush) {
 #endif
     if (retransmission) {
       ESP_LOGV(TAG, "Ignoring retransmitted frame dest 0x%02x cmd 0x%04x", dest, command);
-      this->stats_.retransmissions++;
       continue;
     }
     ESP_LOGV(TAG, "Valid frame dest 0x%02x cmd 0x%04x: 0x%s", dest, command,
@@ -332,7 +305,6 @@ void BSHDBus::parse_rx_buffer_(bool flush) {
   }
 
   if (skip_reason != nullptr) {
-    this->stats_.skipped_bytes += pos - skip_start;
     ESP_LOGV(TAG, "Skipped %zu bytes of invalid data (%s): 0x%s", pos - skip_start, LOG_STR_ARG(skip_reason),
              format_hex_to(hex_buf, sizeof(hex_buf), data + skip_start, pos - skip_start));
   }
