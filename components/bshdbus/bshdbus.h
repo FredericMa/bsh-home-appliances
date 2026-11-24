@@ -93,10 +93,13 @@ class BSHDBus final : public uart::UARTDevice, public Component {
  protected:
   std::vector<uint8_t> rx_buffer_;
   std::vector<uint8_t> frame_;
+  std::vector<uint8_t> last_frame_;  // to recognize a retransmission
   std::vector<uint8_t> message_;
   uint32_t last_rx_{0};
   uint8_t last_dest_{0};
+  uint32_t last_frame_at_{0};
   bool expect_ack_{false};
+  bool last_frame_unacked_{false};  // missing or negative ACK, so a retransmission follows
   std::vector<BSHDBusListener *> listeners_{};
   LazyCallbackManager<void(const std::vector<uint8_t> &, uint8_t, uint16_t, const std::vector<uint8_t> &)>
       frame_callbacks_{};

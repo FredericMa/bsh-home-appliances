@@ -52,6 +52,10 @@ static constexpr size_t BSHDBUS_MAX_CMDFRAME_LENGTH = 255;
    a loop() cycle. A UART task or event with byte timestamps could use the real value. */
 static constexpr uint16_t BSHDBUS_RX_TIMEOUT = 20;
 
+/* A frame that was not acknowledged (missing or negative ACK) is retransmitted by its sender after a random
+   back-off; an identical frame within this window after such a frame is taken as the retransmission */
+static constexpr uint32_t BSHDBUS_RETRANSMIT_WINDOW = 250;
+
 /* Sufficient for most cases, some larger frames may be truncated */
 static constexpr size_t BSHDBUS_MAX_LOG_BYTES = 128;
 
@@ -88,6 +92,7 @@ static constexpr uint32_t BSHDBUS_TX_QUIET_RANDOM_BYTES = 4;
 void BSHDBus::setup() {
   this->rx_buffer_.reserve(2 * BSHDBUS_MAX_CMDFRAME_LENGTH);
   this->frame_.reserve(BSHDBUS_MAX_CMDFRAME_LENGTH);
+  this->last_frame_.reserve(BSHDBUS_MAX_CMDFRAME_LENGTH);
   this->message_.reserve(BSHDBUS_MAX_CMDFRAME_LENGTH);
 #ifdef USE_BSHDBUS_SEND
   if (this->tx_enabled_) {
@@ -139,7 +144,7 @@ void BSHDBus::loop() {
     if (!this->rx_buffer_.empty()) {
       /* No more bytes of the pending frame will arrive; it may have started at a wrong (length) byte,
          so resynchronize on the rest instead of dropping frames hidden in it */
-      ESP_LOGV(TAG, "Flushing %zu bytes of unparsed data after timeout of %" PRIu32 " ms", this->rx_buffer_.size(),
+      ESP_LOGVV(TAG, "Flushing %zu bytes of unparsed data after timeout of %" PRIu32 " ms", this->rx_buffer_.size(),
                delta_rx);
       this->parse_rx_buffer_(true);
     }
@@ -147,9 +152,10 @@ void BSHDBus::loop() {
        after about 19 bit times (~2 ms at 9600 baud). Without byte timestamps, the ACK is awaited until the RX
        timeout instead. */
     if (this->expect_ack_) {
-      ESP_LOGD(TAG, "Timed out ACK for dest 0x%02x of preceding frame after %" PRIu32 " ms", this->last_dest_,
+      ESP_LOGV(TAG, "Timed out ACK for dest 0x%02x of preceding frame after %" PRIu32 " ms", this->last_dest_,
                delta_rx);
       this->expect_ack_ = false;
+      this->last_frame_unacked_ = true;
 #ifdef USE_BSHDBUS_SEND
       this->on_tx_ack_(false);
 #endif
@@ -195,28 +201,53 @@ void BSHDBus::parse_rx_buffer_(bool flush) {
   auto log_skipped = [&]() {
     if (skip_reason == nullptr)
       return;
-    ESP_LOGD(TAG, "Skipped %zu bytes of invalid data (%s), resynchronized: 0x%s", pos - skip_start,
+    ESP_LOGV(TAG, "Skipped %zu bytes of invalid data (%s), resynchronized: 0x%s", pos - skip_start,
              LOG_STR_ARG(skip_reason), format_hex_to(hex_buf, sizeof(hex_buf), data + skip_start, pos - skip_start));
     skip_reason = nullptr;
   };
 
   while (pos < size) {
     if (this->expect_ack_) {
-      this->expect_ack_ = false;
+      const uint8_t ack = data[pos];
+      const bool broadcast = (this->last_dest_ & 0xF0) == 0;
       /* Broadcasts are acknowledged with 0x0A or the node id of the sender, depending on the firmware.
-         Receivers may also answer 0x?7 (CRC error) or 0x?3 (frame too long or busy, depending on the
-         firmware). Without byte timing, such a byte looks like the length byte of a frame that follows
-         without ACK, so it is read as one, and only 0x?A counts as ACK. */
-      if (((data[pos] & 0x0F) == 0x0A) &&
-          (((this->last_dest_ & 0xF0) == 0) || ((data[pos] & 0xF0) == (this->last_dest_ & 0xF0)))) {
-        ESP_LOGV(TAG, "Received valid ACK 0x%02x for dest 0x%02x of preceding frame", data[pos], this->last_dest_);
+         Other frames are acknowledged by the receiver, with its node id in the upper nibble. */
+      if (((ack & 0x0F) == 0x0A) && (broadcast || ((ack & 0xF0) == (this->last_dest_ & 0xF0)))) {
+        ESP_LOGV(TAG, "Received valid ACK 0x%02x for dest 0x%02x of preceding frame", ack, this->last_dest_);
+        this->expect_ack_ = false;
+        this->last_frame_unacked_ = false;
 #ifdef USE_BSHDBUS_SEND
         this->on_tx_ack_(true);
 #endif
         pos++;
         continue;
       }
-      ESP_LOGD(TAG, "Missed ACK for dest 0x%02x of preceding frame", this->last_dest_);
+      /* Receivers may also answer 0x?7 (CRC error) or 0x?3 (frame too long or busy, depending on the
+         firmware). Without byte timing, such a byte looks like the length byte of a frame that follows
+         without ACK: it only counts as a reply if no valid frame starts with it. */
+      const uint8_t reply = ack & 0x0F;
+      if (!broadcast && ((reply == 0x03) || (reply == 0x07)) && ((ack & 0xF0) == (this->last_dest_ & 0xF0))) {
+        const size_t framelen = 1 + 1 + 2 + static_cast<size_t>(ack);
+        const bool complete = framelen <= size - pos;
+        if (!complete && !flush)
+          /* Wait for more bytes */
+          break;
+        if (!complete || crc16be(data + pos, framelen, 0x0, 0x1021, false, false)) {
+          log_skipped();
+          ESP_LOGV(TAG, "Received %s reply 0x%02x for dest 0x%02x of preceding frame",
+                   reply == 0x03 ? LOG_STR_LITERAL("busy") : LOG_STR_LITERAL("CRC error"), ack, this->last_dest_);
+          this->expect_ack_ = false;
+          this->last_frame_unacked_ = true;
+#ifdef USE_BSHDBUS_SEND
+          this->on_tx_ack_(false);
+#endif
+          pos++;
+          continue;
+        }
+      }
+      ESP_LOGV(TAG, "Missed ACK for dest 0x%02x of preceding frame", this->last_dest_);
+      this->expect_ack_ = false;
+      this->last_frame_unacked_ = true;
 #ifdef USE_BSHDBUS_SEND
       this->on_tx_ack_(false);
 #endif
@@ -251,17 +282,30 @@ void BSHDBus::parse_rx_buffer_(bool flush) {
     /* Skip bytes for LL + DS + CCCC at beginning, CRC at end */
     this->message_.assign(this->frame_.begin() + 1 + 1 + 2, this->frame_.end() - 2);
 
-    ESP_LOGV(TAG, "Valid frame dest 0x%02x cmd 0x%04x: 0x%s", dest, command,
-             format_hex_to(hex_buf, sizeof(hex_buf), this->message_.data(), this->message_.size()));
+    const uint32_t now = App.get_loop_component_start_time();
+    const bool retransmission = this->last_frame_unacked_ &&
+                                (now - this->last_frame_at_ <= BSHDBUS_RETRANSMIT_WINDOW) &&
+                                (this->frame_ == this->last_frame_);
+    this->last_frame_unacked_ = false;
+    this->last_frame_at_ = now;
+    if (!retransmission)
+      this->last_frame_ = this->frame_;
+
 #ifdef USE_BSHDBUS_SEND
     this->on_tx_frame_(this->frame_.data(), this->frame_.size());
 #endif
+    if (retransmission) {
+      ESP_LOGV(TAG, "Ignoring retransmitted frame dest 0x%02x cmd 0x%04x", dest, command);
+      continue;
+    }
+    ESP_LOGV(TAG, "Valid frame dest 0x%02x cmd 0x%04x: 0x%s", dest, command,
+             format_hex_to(hex_buf, sizeof(hex_buf), this->message_.data(), this->message_.size()));
     this->frame_callbacks_.call(this->frame_, dest, command, this->message_);
     this->dispatch_message_(dest, command, this->message_);
   }
 
   if (skip_reason != nullptr) {
-    ESP_LOGD(TAG, "Skipped %zu bytes of invalid data (%s): 0x%s", pos - skip_start, LOG_STR_ARG(skip_reason),
+    ESP_LOGV(TAG, "Skipped %zu bytes of invalid data (%s): 0x%s", pos - skip_start, LOG_STR_ARG(skip_reason),
              format_hex_to(hex_buf, sizeof(hex_buf), data + skip_start, pos - skip_start));
   }
   this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + pos);
