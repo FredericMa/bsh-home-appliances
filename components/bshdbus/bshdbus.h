@@ -92,6 +92,7 @@ class BSHDBus final : public uart::UARTDevice, public Component {
 
  protected:
   std::vector<uint8_t> rx_buffer_;
+  std::vector<uint8_t> frame_;
   std::vector<uint8_t> message_;
   uint32_t last_rx_{0};
   uint8_t last_dest_{0};
@@ -100,6 +101,7 @@ class BSHDBus final : public uart::UARTDevice, public Component {
   LazyCallbackManager<void(const std::vector<uint8_t> &, uint8_t, uint16_t, const std::vector<uint8_t> &)>
       frame_callbacks_{};
 
+  void parse_rx_buffer_(bool flush);
   void dispatch_message_(uint8_t dest, uint16_t command, const std::vector<uint8_t> &message);
 
 #ifdef USE_BSHDBUS_SEND
@@ -122,7 +124,7 @@ class BSHDBus final : public uart::UARTDevice, public Component {
   bool sending_allowed_(bool log);
   void process_tx_(uint32_t now, bool received);
   void start_attempt_(uint32_t now);
-  void on_tx_frame_();
+  void on_tx_frame_(const uint8_t *data, size_t len);
   void on_tx_ack_(bool valid);
   void on_tx_collision_(const LogString *reason, bool no_echo = false);
   void next_attempt_();
